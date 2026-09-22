@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License."""
 
 import time
+import threading
 from six.moves import queue
 
 from carbon import state
@@ -34,6 +35,47 @@ except ImportError:
 
 SCHEMAS = loadStorageSchemas()
 AGGREGATION_SCHEMAS = loadAggregationSchemas()
+
+
+class SchemaMatchCache(object):
+  """Caches the first matching schema for a metric name.
+
+  Schema lists are scanned in order on first lookup and the result is reused
+  afterwards. ``replace_schemas`` atomically swaps in a new schema list and
+  discards all cached matches, so a config reload is followed by a fresh
+  resolution while an in-flight lookup keeps using a consistent snapshot.
+  """
+
+  def __init__(self, schemas):
+    self._lock = threading.RLock()
+    self._schemas = schemas
+    self._matches = {}
+
+  def match(self, metric):
+    "Return the first schema matching metric, or None. Result is cached."
+    with self._lock:
+      try:
+        return self._matches[metric]
+      except KeyError:
+        pass
+
+      for schema in self._schemas:
+        if schema.matches(metric):
+          self._matches[metric] = schema
+          return schema
+
+      self._matches[metric] = None
+      return None
+
+  def replace_schemas(self, schemas):
+    "Atomically install a new schema list and invalidate cached matches."
+    with self._lock:
+      self._schemas = schemas
+      self._matches = {}
+
+
+STORAGE_SCHEMA_CACHE = SchemaMatchCache(SCHEMAS)
+AGGREGATION_SCHEMA_CACHE = SchemaMatchCache(AGGREGATION_SCHEMAS)
 
 
 # Initialize token buckets so that we can enforce rate limits on creates and
@@ -117,20 +159,18 @@ def writeCachedDataPoints():
       archiveConfig = None
       xFilesFactor, aggregationMethod = None, None
 
-      for schema in SCHEMAS:
-        if schema.matches(metric):
-          if settings.LOG_CREATES:
-            log.creates('new metric %s matched schema %s' % (metric, schema.name))
-          archiveConfig = [archive.getTuple() for archive in schema.archives]
-          break
+      schema = STORAGE_SCHEMA_CACHE.match(metric)
+      if schema is not None:
+        if settings.LOG_CREATES:
+          log.creates('new metric %s matched schema %s' % (metric, schema.name))
+        archiveConfig = [archive.getTuple() for archive in schema.archives]
 
-      for schema in AGGREGATION_SCHEMAS:
-        if schema.matches(metric):
-          if settings.LOG_CREATES:
-            log.creates('new metric %s matched aggregation schema %s'
-                        % (metric, schema.name))
-          xFilesFactor, aggregationMethod = schema.archives
-          break
+      aggregationSchema = AGGREGATION_SCHEMA_CACHE.match(metric)
+      if aggregationSchema is not None:
+        if settings.LOG_CREATES:
+          log.creates('new metric %s matched aggregation schema %s'
+                      % (metric, aggregationSchema.name))
+        xFilesFactor, aggregationMethod = aggregationSchema.archives
 
       if not archiveConfig:
         raise Exception(("No storage schema matched the metric '%s',"
@@ -235,17 +275,23 @@ def writeTagsForever():
 def reloadStorageSchemas():
   global SCHEMAS
   try:
-    SCHEMAS = loadStorageSchemas()
+    new_schemas = loadStorageSchemas()
   except Exception as e:
     log.msg("Failed to reload storage SCHEMAS: %s" % (e))
+  else:
+    SCHEMAS = new_schemas
+    STORAGE_SCHEMA_CACHE.replace_schemas(new_schemas)
 
 
 def reloadAggregationSchemas():
   global AGGREGATION_SCHEMAS
   try:
-    AGGREGATION_SCHEMAS = loadAggregationSchemas()
+    new_schemas = loadAggregationSchemas()
   except Exception as e:
     log.msg("Failed to reload aggregation SCHEMAS: %s" % (e))
+  else:
+    AGGREGATION_SCHEMAS = new_schemas
+    AGGREGATION_SCHEMA_CACHE.replace_schemas(new_schemas)
 
 
 def shutdownModifyUpdateSpeed():
